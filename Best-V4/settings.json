@@ -1,0 +1,12 @@
+{
+  "autoStart": false,
+  "animations": true,
+  "assistantName": "Mayra",
+  "voiceTone": "Sweet and Youthful",
+  "fileSystemAccess": true,
+  "screenShareAccess": true,
+  "microphoneAccess": true,
+  "cameraAccess": true,
+  "systemCommandsAccess": true,
+  "muteVoice": false
+}
