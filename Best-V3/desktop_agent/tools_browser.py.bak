@@ -1,0 +1,629 @@
+"""
+Browser automation via Playwright.
+
+Runs a single persistent headed Chromium instance owned by this agent
+(independent of the in-app holographic BrowserAgent and the separate
+local-agent.js Playwright server on :3001).
+
+Capabilities: open/navigate, new/close tabs, search, click, type, fill forms,
+back/forward, scroll. Lazy-initialized; robust to closed pages.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+from typing import Any, Dict, Optional
+from urllib.parse import quote_plus
+
+from .registry import STATE, ToolError, register
+
+# A dedicated event loop + thread runs all Playwright coroutines, because
+# Playwright's sync API can deadlock under FastAPI's threadpool. We use the
+# async API marshalled through a single loop.
+_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_LOOP_THREAD: Optional[threading.Thread] = None
+_LOOP_LOCK = threading.Lock()
+
+
+def _get_loop() -> "asyncio.AbstractEventLoop":
+    global _LOOP, _LOOP_THREAD
+    with _LOOP_LOCK:
+        if _LOOP is None or _LOOP.is_closed():
+            _LOOP = asyncio.new_event_loop()
+            _LOOP_THREAD = threading.Thread(target=_run_loop, daemon=True)
+            _LOOP_THREAD.start()
+        return _LOOP
+
+
+def _run_loop() -> None:
+    loop = _LOOP
+    assert loop is not None
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_forever()
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
+def _run(coro):
+    """Submit a coroutine to the dedicated Playwright loop and block on it."""
+    loop = _get_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result(timeout=90)
+
+
+# --- Async Playwright lifecycle ---------------------------------------------
+
+
+async def _ensure_browser_async() -> Any:
+    healthy = True
+    if STATE.context is not None:
+        try:
+            _ = STATE.context.pages
+        except Exception:
+            healthy = False
+
+    if STATE.page is not None:
+        try:
+            _ = STATE.page.url
+        except Exception:
+            healthy = False
+
+    if not healthy:
+        STATE.reset_playwright()
+    elif STATE.page is not None:
+        return STATE.page
+
+    if STATE.playwright is None:
+        try:
+            from playwright.async_api import async_playwright
+
+            STATE.playwright = await async_playwright().start()
+        except Exception as e:
+            STATE.reset_playwright()
+            msg = str(e)
+            if "Executable doesn't exist" in msg or "playwright install" in msg.lower():
+                raise ToolError(
+                    "Chromium browser is not installed for Playwright. "
+                    "Run this command once in a terminal: "
+                    "python -m playwright install chromium"
+                ) from e
+            raise ToolError(f"Could not start Playwright: {e}") from e
+
+    if STATE.context is None:
+        # Persistent context: profile survives restarts (logins, cookies, tabs).
+        # Stored in the per-user data dir so it works in packaged mode too.
+        import os
+        from .registry import STATE as _S  # noqa
+        profile_dir = os.path.join(os.environ.get("MYRAA_DATA_DIR", os.getcwd()), "browser-profile")
+        try:
+            os.makedirs(profile_dir, exist_ok=True)
+        except Exception:
+            pass
+
+        launch_args = [
+            "--start-maximized",
+            "--no-sandbox",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=TranslateUI",
+        ]
+
+        last_err = None
+        for attempt in range(2):
+            try:
+                STATE.context = await STATE.playwright.chromium.launch_persistent_context(
+                    profile_dir,
+                    headless=False,
+                    args=launch_args,
+                    viewport=None,
+                    no_viewport=True,
+                    ignore_default_args=["--enable-automation"],
+                )
+                # launch_persistent_context returns a BrowserContext; the browser
+                # handle is implicit. Store a sentinel so the checks below pass.
+                STATE.browser = "persistent"  # type: ignore
+                break
+            except Exception as e:
+                last_err = e
+                STATE.reset_playwright()
+                # Retry: restart the playwright driver too
+                if attempt == 0:
+                    try:
+                        from playwright.async_api import async_playwright
+                        STATE.playwright = await async_playwright().start()
+                    except Exception:
+                        pass
+                msg = str(e)
+                if "Executable doesn't exist" in msg or "playwright install" in msg.lower():
+                    raise ToolError(
+                        "Chromium browser is not installed for Playwright. "
+                        "Run this command once in a terminal: "
+                        "python -m playwright install chromium"
+                    ) from e
+        if STATE.context is None:
+            raise ToolError(f"Could not launch Chromium after retry: {last_err}")
+
+    pages = STATE.context.pages
+    if pages:
+        STATE.page = pages[-1]
+    else:
+        STATE.page = await STATE.context.new_page()
+    return STATE.page
+
+
+async def _page() -> Any:
+    return await _ensure_browser_async()
+
+
+def _normalize_url(raw: str) -> str:
+    url = raw.strip()
+    if not url:
+        raise ToolError("Empty URL.")
+    if "://" not in url:
+        url = "https://" + url
+    return url
+
+
+async def _retry_browser_op(op_name: str, op_func, retries: int = 1):
+    """Run a browser operation function, resetting the browser context on failure and retrying.
+
+    This guards against browser crashes mid-operation: if the page or context
+    dies, we tear down and re-initialize the entire Playwright stack before
+    the next attempt.
+    """
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            return await op_func()
+        except Exception as e:
+            last_err = e
+            STATE.reset_playwright()
+            if attempt < retries:
+                import time
+                time.sleep(0.5)
+    raise ToolError(f"{op_name} failed after {retries + 1} attempt(s): {last_err}") from last_err
+
+
+# --- Handlers ---------------------------------------------------------------
+
+
+@register("desktopBrowserOpen")
+@register("browserOpen")
+@register("desktopBrowserNavigate")
+async def browser_open(args: Dict[str, Any]) -> Dict[str, Any]:
+    url = _normalize_url(args.get("url") or "https://www.google.com")
+
+    async def _do():
+        page = await _page()
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        return {"result": f"Opened {url} in the automation browser.", "url": page.url, "title": await page.title()}
+
+    return await _retry_browser_op("browserOpen", _do, retries=1)
+
+
+@register("desktopBrowserOpenTab")
+async def browser_open_tab(args: Dict[str, Any]) -> Dict[str, Any]:
+    url = _normalize_url(args.get("url") or "about:blank")
+    await _ensure_browser_async()
+    ctx = STATE.context
+    page = await ctx.new_page()
+    STATE.page = page  # make it active
+    if url != "about:blank":
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            await page.wait_for_load_state("domcontentloaded")
+        except Exception as e:  # noqa: BLE001
+            raise ToolError(f"Opened tab but navigation failed: {e}")
+    return {"result": f"New tab opened at {url}.", "url": page.url}
+
+
+@register("browserTabAction")
+async def browser_tab_action(args: Dict[str, Any]) -> Dict[str, Any]:
+    action = args.get("action")
+    url = args.get("url") or "about:blank"
+    if action == "new":
+        return await browser_open_tab({"url": url})
+    elif action == "close":
+        return await browser_close_tab(args)
+    elif action == "switch":
+        pages = STATE.context.pages if STATE.context else []
+        if pages:
+            STATE.page = pages[-1]
+            return {"result": f"Switched active tab. Currently on {STATE.page.url}", "url": STATE.page.url}
+        return {"result": "No tabs to switch."}
+    return {"result": f"Unknown tab action: {action}"}
+
+
+@register("desktopBrowserCloseTab")
+async def browser_close_tab(args: Dict[str, Any]) -> Dict[str, Any]:
+    page = await _page()
+    try:
+        await page.close()
+    except Exception:
+        pass
+    pages = STATE.context.pages if STATE.context else []
+    STATE.page = pages[-1] if pages else None
+    if STATE.page is None:
+        return {"result": "Closed the last tab; browser now empty."}
+    return {"result": f"Closed tab. Active tab now: {STATE.page.url}"}
+
+
+@register("desktopBrowserSearch")
+@register("browserSearch")
+async def browser_search(args: Dict[str, Any]) -> Dict[str, Any]:
+    query = args.get("query") or args.get("q")
+    engine = (args.get("engine") or "google").strip().lower()
+    if not query:
+        raise ToolError("Parameter 'query' is required.")
+    
+    page = await _page()
+    is_youtube = "youtube.com" in page.url
+    is_google = "google.com" in page.url
+    
+    searched_on_page = False
+    if is_youtube or is_google:
+        # Try finding the live search input box on current website
+        selectors = ["input#search", "input[name='search_query']", "input[name='q']", "input[type='text']", "[placeholder*='Search']"]
+        for sel in selectors:
+            try:
+                loc = page.locator(sel)
+                if await loc.count() > 0:
+                    await loc.first.fill(str(query))
+                    await loc.first.press("Enter")
+                    searched_on_page = True
+                    break
+            except Exception:
+                pass
+                
+    if not searched_on_page:
+        # Fallback to direct search URL navigation
+        q = quote_plus(str(query))
+        url = {
+            "google": f"https://www.google.com/search?q={q}",
+            "youtube": f"https://www.youtube.com/results?search_query={q}",
+            "github": f"https://github.com/search?q={q}",
+            "duckduckgo": f"https://duckduckgo.com/?q={q}",
+            "bing": f"https://www.bing.com/search?q={q}",
+        }.get(engine, f"https://www.google.com/search?q={q}")
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+        except Exception as e:  # noqa: BLE001
+            raise ToolError(f"Search navigation failed: {e}")
+            
+    # Action verification
+    await asyncio.sleep(2)
+    return {"result": f"Searched {engine} for '{query}' successfully.", "url": page.url}
+
+
+@register("desktopBrowserClick")
+@register("browserClick")
+async def browser_click(args: Dict[str, Any]) -> Dict[str, Any]:
+    selector = args.get("selector")
+    text = args.get("text")
+    page = await _page()
+    
+    is_youtube = "youtube.com" in page.url
+    
+    # Smart YouTube Playback Click triggers
+    if is_youtube and (selector in ["first_video", "first"] or (text and "first" in text.lower()) or not (selector or text)):
+        video_selectors = [
+            "ytd-video-renderer a#video-title-link",
+            "ytd-video-renderer a#thumbnail",
+            "a#video-title",
+            "ytd-grid-video-renderer a#video-title",
+            "a#video-title-link",
+            "ytd-video-renderer a"
+        ]
+        for sel in video_selectors:
+            try:
+                loc = page.locator(sel)
+                if await loc.count() > 0:
+                    await loc.first.click(timeout=8000)
+                    
+                    # Verification check
+                    try:
+                        await page.wait_for_selector("video", timeout=12000)
+                        await asyncio.sleep(2)
+                        is_playing = await page.evaluate("() => { const v = document.querySelector('video'); return v && !v.paused; }")
+                        if not is_playing:
+                            await page.keyboard.press("k")
+                            await asyncio.sleep(1)
+                            is_playing = await page.evaluate("() => { const v = document.querySelector('video'); return v && !v.paused; }")
+                        if is_playing:
+                            return {"result": "Successfully clicked first video and verified playback started.", "url": page.url}
+                    except Exception:
+                        pass
+                    return {"result": "Clicked the first video. It's loading.", "url": page.url}
+            except Exception:
+                pass
+                
+    # Standard Multi-strategy clicking
+    try:
+        if selector:
+            clicked_selector = False
+            try:
+                await page.click(selector, timeout=5000)
+                clicked_selector = True
+            except Exception as exact_err:
+                # If exact selector click failed, try smart fallbacks
+                fallbacks = []
+                # If it's a plain word/identifier, try standard id/class prefixes
+                if not any(c in selector for c in ["#", ".", "[", "]", ">", " ", ":", "=", "*"]):
+                    fallbacks = [
+                        f"#{selector}",
+                        f".{selector}",
+                        f"[id*='{selector}']",
+                        f"[class*='{selector}']",
+                        f"a#{selector}",
+                        f"button#{selector}",
+                        f"text='{selector}'"
+                    ]
+                else:
+                    # If it has some CSS chars but still failed, try partial attribute match
+                    clean_sel = selector.replace("#", "").replace(".", "").strip()
+                    if clean_sel:
+                        fallbacks = [
+                            f"[id*='{clean_sel}']",
+                            f"[class*='{clean_sel}']",
+                            f"text='{clean_sel}'"
+                        ]
+                
+                for fb in fallbacks:
+                    try:
+                        await page.click(fb, timeout=2000)
+                        clicked_selector = True
+                        break
+                    except Exception:
+                        continue
+                
+                if not clicked_selector:
+                    try:
+                        await page.get_by_role("button", name=selector, exact=False).first.click(timeout=2000)
+                        clicked_selector = True
+                    except Exception:
+                        pass
+                
+                if not clicked_selector:
+                    try:
+                        await page.get_by_role("link", name=selector, exact=False).first.click(timeout=2000)
+                        clicked_selector = True
+                    except Exception:
+                        pass
+                
+                if not clicked_selector:
+                    raise ToolError(f"Click failed on selector '{selector}' and all ID/Class/Text fallbacks failed: {exact_err}")
+        elif text:
+            clicked = False
+            # Accessibility + text matching fallbacks
+            strategies = [
+                lambda p: p.get_by_text(str(text), exact=False).first.click(timeout=3000),
+                lambda p: p.get_by_role("button", name=str(text), exact=False).first.click(timeout=2000),
+                lambda p: p.get_by_role("link", name=str(text), exact=False).first.click(timeout=2000),
+                lambda p: p.click(f"text='{text}'", timeout=2000),
+                lambda p: p.click(f"//*[contains(text(), '{text}')]", timeout=2000)
+            ]
+            for strat in strategies:
+                try:
+                    await strat(page)
+                    clicked = True
+                    break
+                except Exception:
+                    continue
+            if not clicked:
+                raise ToolError(f"Could not click text: '{text}' using multiple matching strategies.")
+        else:
+            raise ToolError("Provide 'selector' or 'text' to click.")
+    except Exception as e:  # noqa: BLE001
+        raise ToolError(f"Click failed: {e}")
+        
+    await asyncio.sleep(1)
+    return {"result": f"Successfully clicked {selector or text}.", "url": page.url}
+
+
+@register("desktopBrowserType")
+@register("browserType")
+async def browser_type(args: Dict[str, Any]) -> Dict[str, Any]:
+    text = args.get("text")
+    selector = args.get("selector")
+    clear_first = bool(args.get("clear", True))
+    if not text:
+        raise ToolError("Parameter 'text' is required.")
+    page = await _page()
+    try:
+        if selector:
+            await page.fill(selector, str(text), timeout=5000)
+        else:
+            if clear_first:
+                await page.keyboard.press("Control+A")
+                await page.keyboard.press("Delete")
+            await page.keyboard.type(str(text))
+    except Exception as e:  # noqa: BLE001
+        raise ToolError(f"Type failed: {e}")
+    return {"result": f"Typed '{text}' successfully."}
+
+
+@register("desktopBrowserFillForm")
+async def browser_fill_form(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Fill multiple fields. fields = { selector: value, ... }"""
+    fields = args.get("fields")
+    submit = args.get("submit")
+    if not isinstance(fields, dict) or not fields:
+        raise ToolError("Parameter 'fields' (object of selector->value) is required.")
+    page = await _page()
+    filled = 0
+    try:
+        for sel, val in fields.items():
+            await page.fill(str(sel), str(val), timeout=5000)
+            filled += 1
+        if submit:
+            await page.click(str(submit), timeout=5000)
+    except Exception as e:  # noqa: BLE001
+        raise ToolError(f"Form fill failed after {filled} field(s): {e}")
+    extra = " and submitted." if submit else "."
+    return {"result": f"Filled {filled} field(s){extra}"}
+
+
+@register("desktopBrowserGoBack")
+@register("browserGoBack")
+async def browser_go_back(args: Dict[str, Any]) -> Dict[str, Any]:
+    page = await _page()
+    try:
+        await page.go_back(timeout=15000)
+    except Exception as e:  # noqa: BLE001
+        raise ToolError(f"Back failed: {e}")
+    return {"result": f"Went back. Now on {page.url}.", "url": page.url}
+
+
+@register("desktopBrowserGoForward")
+async def browser_go_forward(args: Dict[str, Any]) -> Dict[str, Any]:
+    page = await _page()
+    try:
+        await page.go_forward(timeout=15000)
+    except Exception as e:  # noqa: BLE001
+        raise ToolError(f"Forward failed: {e}")
+    return {"result": f"Went forward. Now on {page.url}.", "url": page.url}
+
+
+@register("desktopBrowserScroll")
+@register("browserScroll")
+async def browser_scroll(args: Dict[str, Any]) -> Dict[str, Any]:
+    direction = (args.get("direction") or "down").lower()
+    amount = int(args.get("amount", 500))
+    delta = amount if direction != "up" else -amount
+    page = await _page()
+    try:
+        await page.mouse.wheel(0, delta)
+    except Exception as e:  # noqa: BLE001
+        raise ToolError(f"Scroll failed: {e}")
+    return {"result": f"Scrolled {direction} {amount}px."}
+
+
+@register("browserMediaControl")
+@register("desktopBrowserMediaControl")
+async def browser_media_control(args: Dict[str, Any]) -> Dict[str, Any]:
+    action = args.get("action") or args.get("command")
+    page = await _page()
+    
+    if not action:
+        raise ToolError("Parameter 'action' is required.")
+        
+    action = action.lower().strip()
+    
+    if action == "pause":
+        paused = await page.evaluate("() => { const v = document.querySelector('video'); if (v) { v.pause(); return v.paused; } return false; }")
+        if not paused and "youtube.com" in page.url:
+            await page.keyboard.press("k")
+            paused = await page.evaluate("() => { const v = document.querySelector('video'); return v ? v.paused : true; }")
+        return {"result": "Video paused successfully." if paused else "Sent pause command."}
+        
+    elif action == "play":
+        playing = await page.evaluate("() => { const v = document.querySelector('video'); if (v) { v.play(); return !v.paused; } return false; }")
+        if not playing and "youtube.com" in page.url:
+            await page.keyboard.press("k")
+            playing = await page.evaluate("() => { const v = document.querySelector('video'); return v ? !v.paused : true; }")
+        return {"result": "Video is playing." if playing else "Sent play command."}
+        
+    elif action in ["volume", "set_volume"]:
+        vol = args.get("value")
+        if vol is None:
+            vol = 50
+        success = await page.evaluate(f"() => {{ const v = document.querySelector('video'); if (v) {{ v.volume = {vol / 100.0}; return true; }} return false; }}")
+        return {"result": f"Volume set to {vol}%." if success else "Volume set level command sent."}
+        
+    elif action in ["volumeup", "volume_up", "increase_volume", "increase"]:
+        if "youtube.com" in page.url:
+            await page.keyboard.press("ArrowUp")
+        else:
+            await page.evaluate("() => { const v = document.querySelector('video'); if (v) { v.volume = Math.min(1.0, v.volume + 0.1); } }")
+        return {"result": "Volume increased."}
+        
+    elif action in ["volumedown", "volume_down", "decrease_volume", "decrease"]:
+        if "youtube.com" in page.url:
+            await page.keyboard.press("ArrowDown")
+        else:
+            await page.evaluate("() => { const v = document.querySelector('video'); if (v) { v.volume = Math.max(0.0, v.volume - 0.1); } }")
+        return {"result": "Volume decreased."}
+        
+    elif action in ["mute", "unmute", "toggle_mute"]:
+        muted = await page.evaluate("() => { const v = document.querySelector('video'); if (v) { v.muted = !v.muted; return v.muted; } return null; }")
+        if muted is None and "youtube.com" in page.url:
+            await page.keyboard.press("m")
+            muted = await page.evaluate("() => { const v = document.querySelector('video'); return v ? v.muted : true; }")
+        return {"result": "Volume muted." if muted else "Volume unmuted."}
+        
+    elif action == "skip":
+        if "youtube.com" in page.url:
+            await page.keyboard.press("ArrowRight")
+        return {"result": "Skipped forward."}
+        
+    elif action in ["fullscreen", "exit_fullscreen"]:
+        if "youtube.com" in page.url:
+            await page.keyboard.press("f")
+        return {"result": "Toggled fullscreen mode."}
+        
+    return {"result": f"Unknown media action: {action}"}
+
+
+# Wrap the async handlers so FastAPI's sync threadpool path can call them.
+# Each @register'd async function above is replaced by a sync wrapper below.
+def _sync_wrap(async_fn):
+    def wrapper(args: Dict[str, Any]) -> Dict[str, Any]:
+        return _run(async_fn(args))
+
+    wrapper.__name__ = async_fn.__name__
+    wrapper.__doc__ = async_fn.__doc__
+    return wrapper
+
+
+# Re-register all async handlers as synchronous wrappers so the registry
+# dispatcher (which is sync) can call them uniformly.
+from .registry import TOOLS  # noqa: E402
+
+for _name, _orig in list(TOOLS.items()):
+    if asyncio.iscoroutinefunction(_orig):
+        TOOLS[_name] = _sync_wrap(_orig)
+
+
+def shutdown_browser() -> None:
+    """Cleanly stop the Playwright browser (called on app shutdown)."""
+    if STATE.browser is None:
+        return
+
+    async def _stop():
+        try:
+            if STATE.browser:
+                await STATE.browser.close()
+        except Exception:
+            pass
+        try:
+            if STATE.playwright:
+                await STATE.playwright.stop()
+        except Exception:
+            pass
+        STATE.reset_playwright()
+
+    try:
+        _run(_stop())
+    except Exception:
+        STATE.reset_playwright()
+
+
+__all__ = [
+    "browser_open",
+    "browser_open_tab",
+    "browser_close_tab",
+    "browser_search",
+    "browser_click",
+    "browser_type",
+    "browser_fill_form",
+    "browser_go_back",
+    "browser_go_forward",
+    "browser_scroll",
+    "browser_media_control",
+    "browser_tab_action",
+    "shutdown_browser",
+]
